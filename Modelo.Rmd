@@ -1,0 +1,307 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+NOTA: No pude reproducir lo que generó el script, cometí el error de trabajar sobre el mismo script.
+Tomé de referencia z101 y z411. Dejé en el repo RDATA y txt los hiperparametros que obtuve con mi primer semilla que me dieron la mejor ganancia que son:
+20220910 211424	-0.784491950729605	1774	276	9	5	202760087
+20220910 211508	-0.719317375860046	1827	272	9	5	202760088
+20220910 211555	-0.713469066835535	1842	278	10	5	202760089
+20220910 211728	-0.525674582355474	1879	279	9	5	202760091
+20220910 213601	-0.813988426660723	1756	276	9	5	2027600112
+*20220910 213955	-0.46671353928716	1746	276	9	5	2027600116*
+
+Elegí la iteración 116
+cp: -0.467
+minsplit: 1746 
+minbucket: 276 
+maxdepth: 9
+
+Librerías
+
+```{r}
+#limpio la memoria
+rm( list=ls() )  #remove all objects
+gc()             #garbage collection
+
+require("data.table")
+require("rlist")
+require("rpart")
+require("rpart.plot")
+require("parallel")
+require("DiceKriging")
+require("mlrMBO")
+```
+
+#Defino la  Optimizacion Bayesiana
+
+```{r}
+kBO_iter  <- 100   #cantidad de iteraciones de la Optimizacion Bayesiana
+
+hs  <- makeParamSet(
+          makeNumericParam("cp"       , lower= -1   , upper=    0.1),
+          makeIntegerParam("minsplit" , lower=  1L  , upper= 8000L),
+          makeIntegerParam("minbucket", lower=  1L  , upper= 4000L),
+          makeIntegerParam("maxdepth" , lower=  3L  , upper=   20L),
+          forbidden = quote( minbucket > 0.5*minsplit ) ) # minbuket NO PUEDE ser mayor que la mitad de minsplit
+
+#Directorio de Trabajo
+setwd("/Users/vaguero/maestria/DMEyF2022")
+#Semillas
+ksemilla_azar <- 318601 # La primer semilla de mis elegidas. 
+```
+
+#Definición de funciones
+
+Función *loguear*: Sirve para guardar en un archivo los componentes de la lista.
+
+```{r}
+loguear  <- function( reg, arch=NA, folder="./work/", ext=".txt", verbose=TRUE )
+{
+  archivo  <- arch
+  if( is.na(arch) )  archivo  <- paste0( folder, substitute( reg), ext )
+
+  if( !file.exists( archivo ) )  #Escribo los titulos
+  {
+    linea  <- paste0( "fecha\t", 
+                      paste( list.names(reg), collapse="\t" ), "\n" )
+
+    cat( linea, file=archivo )
+  }
+
+  linea  <- paste0( format(Sys.time(), "%Y%m%d %H%M%S"),  "\t",     #la fecha y hora
+                    gsub( ", ", "\t", toString( reg ) ),  "\n" )
+
+  cat( linea, file=archivo, append=TRUE )  #grabo al archivo
+
+  if( verbose )  cat( linea )   #imprimo por pantalla
+}
+```
+
+Función *particionar*: Sirve para agregar una columna llamada fold a un dataset que consiste en una particion estratificada según agrupa
+Modo de uso: Para crear una partición 70-30
+particionar( data=dataset, division=c(70,30), agrupa=clase_ternaria, seed=semilla)
+
+```{r}
+particionar  <- function( data, division, agrupa="", campo="fold", start=1, seed=NA )
+{
+  if( !is.na( seed)  )   set.seed( seed )
+
+  bloque  <- unlist( mapply(  function(x,y) { rep( y, x ) }, division, seq( from=start, length.out=length(division) )  ) )
+
+  data[ , (campo) :=  sample( rep( bloque, ceiling(.N/length(bloque))) )[1:.N],
+           by= agrupa ]
+}
+```
+
+Función *ArbolSimple*: Sirve para generar el modelo con rpart y clase ternaria
+`fold_test`: tiene el número de fold que voy a usar para testear, entreno en el resto de los folds.
+`data`: dataset.
+`param`: tiene los hiperparámetros del árbol.
+IMPORTANTE: Si cambia la clase ternaria por binaria cambiar el punto de corte.
+
+```{r}
+ArbolSimple  <- function( fold_test, data, param)
+{
+  #genero el modelo
+  modelo  <- rpart("clase_ternaria ~ . " , 
+                    data= data[ fold != fold_test, ], 
+                    xval= 0,
+                    control= param )
+
+  #aplico el modelo a los datos de testing
+  prediccion  <- predict( modelo, 
+                          data[ fold==fold_test, ],
+                          type= "prob")   
+
+  prob_baja2  <- prediccion[, "BAJA+2"]  
+
+  ganancia_testing  <- data[ fold==fold_test ][ prob_baja2 > 1/40,  
+                                                sum( ifelse( clase_ternaria=="BAJA+2", 78000, -2000 ) )] 
+
+  return( ganancia_testing )  #esta es la ganancia sobre el fold de testing, NO esta normalizada
+}
+```
+
+```{r}
+ArbolesCrossValidation  <- function( data, param, qfolds, pagrupa, semilla )
+{
+  divi  <- rep( 1, qfolds ) 
+
+  particionar( data, divi, seed=semilla, agrupa=pagrupa )  #particiono en dataset en folds
+
+  ganancias  <- mcmapply( ArbolSimple, 
+                          seq(qfolds), # 1 2 3 4 5
+                          MoreArgs= list( data, param), 
+                          SIMPLIFY= FALSE,
+                          mc.cores= qfolds )   
+
+  data[ , fold := NULL ]
+
+  #devuelvo la primer ganancia y el promedio
+  ganancia_promedio  <- mean( unlist( ganancias ) )   
+  ganancia_promedio_normalizada  <- ganancia_promedio * qfolds  
+  
+  return( ganancia_promedio_normalizada )
+}
+```
+
+Función *EstimarGanancia*
+
+```{r}
+EstimarGanancia  <- function( x )
+{
+   GLOBAL_iteracion  <<-  GLOBAL_iteracion + 1
+
+   xval_folds  <- 5
+   ganancia  <- ArbolesCrossValidation( dataset,
+                                        param= x, #los hiperparametros del arbol
+                                        qfolds= xval_folds,  #la cantidad de folds
+                                        pagrupa= "clase_ternaria",
+                                        semilla= ksemilla_azar )
+
+   #logueo 
+   xx  <- x
+   xx$xval_folds  <-  xval_folds
+   xx$ganancia  <- ganancia
+   xx$iteracion <- GLOBAL_iteracion
+   loguear( xx,  arch= archivo_log )
+
+   return( ganancia )
+}
+```
+
+Función *ObtenerMejoresHiperparametros*: Sirve para obtener los mejores hiperparámetros de la Optimización Bayesiana
+
+```{r}
+ObtenerMejoresHiperparametros <- function(archivo){
+  mis_resultados <- read.table(archivo, header=TRUE,sep="\t")
+
+  return (mis_resultados[which.max(mis_resultados$ganancia),])
+}
+```
+
+Función *EntrenarModeloFinal*: Entrena el modelo con los mejores hiperparámetros
+
+```{r}
+EntrenarModeloFinal<- function(cp,minsplit,minbucket,maxdepth){
+  #genero el modelo,  aqui se construye el arbol
+  modelo  <- rpart(formula   = "clase_ternaria ~ . " ,
+                   data      = dtrain,  
+                   xval      = 0,
+                   cp        = cp,   
+                   minsplit  = minsplit,   #minima cantidad de registros para que se haga el split
+                   minbucket = minbucket,    #tamaño minimo de una hoja
+                   maxdepth  = maxdepth )    #profundidad maxima del arbol
+  
+  prp(modelo, extra=101, digits=5, branch=1, type=4, varlen=0, faclen=0)
+  
+  #aplico el modelo a los datos nuevos
+  prediccion  <- predict( object= modelo,
+                          newdata= dapply,
+                          type = "prob")
+  return (prediccion)
+}
+```
+
+Función *GenerarEntregaKaggle*: Genera la entrega para Kaggle
+
+```{r}
+GenerarEntregaKaggle <- function(prediccion){
+  #agrego a dapply una columna nueva que es la probabilidad de BAJA+2
+  dapply[ , prob_baja2 := prediccion[, "BAJA+2"] ]
+  
+  #solo le envio estimulo a los registros con probabilidad de BAJA+2 mayor  a  1/40
+  dapply[ , Predicted := as.numeric( prob_baja2 > 1/40 ) ]
+  
+  #genero el archivo para Kaggle
+  fwrite( dapply[ , list(numero_de_cliente, Predicted) ],
+          file= "./exp/MODELO/MI_001.csv",
+          sep=  "," )
+  
+  print ("Entrega Kaggle en ./exp/MODELO/MI_001.csv")
+}
+```
+
+
+MAIN
+```{r}
+dataset  <- fread("./datasets/competencia1_2022.csv")
+
+dir.create( "./exp/",  showWarnings = FALSE ) 
+dir.create( "./exp/MODELO/", showWarnings = FALSE )
+setwd("./exp/MODELO/") 
+
+archivo_log  <- "MI003.txt"
+archivo_BO   <- "MI003.RDATA"
+
+GLOBAL_iteracion  <- 0
+
+if( file.exists(archivo_log) )
+{
+ tabla_log  <- fread( archivo_log )
+ GLOBAL_iteracion  <- nrow( tabla_log )
+}
+```
+
+```{r}
+#Bayesian Optimization
+
+funcion_optimizar  <- EstimarGanancia
+
+configureMlr( show.learner.output= FALSE)
+
+#configuro la busqueda bayesiana,  los hiperparametros que se van a optimizar
+obj.fun  <- makeSingleObjectiveFunction(
+              fn=       funcion_optimizar,
+              minimize= FALSE,   #estoy Maximizando la ganancia
+              noisy=    TRUE,
+              par.set=  hs,
+              has.simple.signature = FALSE
+             )
+
+ctrl  <- makeMBOControl( save.on.disk.at.time= 600,  save.file.path= archivo_BO)
+ctrl  <- setMBOControlTermination(ctrl, iters= kBO_iter )
+ctrl  <- setMBOControlInfill(ctrl, crit= makeMBOInfillCritEI())
+
+surr.km  <- makeLearner("regr.km", predict.type= "se", covtype= "matern3_2", control= list(trace= TRUE))
+
+#inicio la optimizacion bayesiana
+if( !file.exists( archivo_BO ) ) {
+
+  run  <- mbo( fun=     obj.fun, 
+               learner= surr.km,
+               control= ctrl)
+
+} else  run  <- mboContinue( archivo_BO )   
+```
+
+
+```{r}
+#Obtengo los mejores hiperaparámetros de la optimización 
+
+mejores_hiperparametros <- ObtenerMejoresHiperparametros(archivo_log)
+
+mejores_hiperparametros
+
+```
+```{r}
+mejores_hiperparametros$maxdepth
+```
+```{r}
+#Vuelvo a cargar el dataset
+dataset  <- fread("./datasets/competencia1_2022.csv")
+
+dtrain  <- dataset[ foto_mes==202101 ]  #defino donde voy a entrenar
+dapply  <- dataset[ foto_mes==202103 ]  #defino donde voy a aplicar el modelo
+
+prediccion <- EntrenarModeloFinal(cp = mejores_hiperparametros$cp,
+                    minsplit = mejores_hiperparametros$minsplit,
+                    minbucket = mejores_hiperparametros$minbucket,
+                    maxdepth = mejores_hiperparametros$maxdepth)
+```
+```{r}
+GenerarEntregaKaggle(prediccion)
+```
+
